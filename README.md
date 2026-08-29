@@ -75,7 +75,6 @@ Masterclass-Batch-10-Health-AI-Agent/
 ├── requirements.txt
 ├── package.json
 └── README.md
-text---
 
 ## Tech Stack
 
@@ -173,24 +172,4 @@ Patria & Co.
 
 Artificial Intelligence Research Division
 
-www.patriaco.co.uk
-Exclusive distribution
-
-Convergeni
-
-Sovereign Plaza, 12th Floor
-
-Jl. TB Simatupang Kav. 36
-
-South Jakarta 13730, Indonesia
-Purchase the handbook: https://convergeni.com/browsebooks
-Email: contact@convergeni.com
-
-
-Support This Project
-
 </div>
-
-All rights reserved.
-
-```
