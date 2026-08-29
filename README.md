@@ -152,8 +152,7 @@ textchapter_10/01_the_ai_health_copilot.py
 chapter_10/01_the_ai_health_copilot.ipynb
 This repository extends that foundation into a complete, deployable application.
 
-Citation
-bibtex@book{patria2026agentic,
+@book{patria2026agentic,
   author    = {Patria, Harry and Setiadi, Felix A.},
   title     = {Agentic AI: Building AI Agents and Retrieval Systems},
   subtitle  = {A Masterclass in LLM Agents, RAG, and Production Deployment},
@@ -162,35 +161,12 @@ bibtex@book{patria2026agentic,
   doi       = {10.5281/zenodo.22049522},
   url       = {https://doi.org/10.5281/zenodo.22049522}
 }
-In-text: (Patria & Setiadi, 2026)
+
 When citing this specific project:
 
 Chapter 10 – AI Health Copilot (Patria & Setiadi, 2026)
 
 <div align="center">
-Authors
-Dr. Harry Patria, PMP®, PMI-CPMAI®
-
-CEO & Chief Data and AI Officer, Patria & Co.
-
-Principal AI Software Engineer, i-Vigilant Technologies UK
-
-Co-founder, Convergence AI
-Felix A. Setiadi, MSc.
-
-Vice President of Data and AI
-
-Co-founder, Convergence AI
-Full biographies appear in the handbook.
-
-Permitted Use
-This code is offered under the same terms as the handbook’s Permitted Use page:
-
-Research, publications, teaching and social media content are welcome
-Use must remain consistent with its educational purpose and must cite the handbook
-Does not extend to repackaging this code or the handbook as a competing commercial product
-
-For any other use, contact the copyright holders directly.
 
 Publisher
 Patria & Co.
