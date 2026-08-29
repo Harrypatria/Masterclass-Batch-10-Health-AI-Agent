@@ -1,0 +1,6 @@
+{
+  "name": "AI Health Copilot Pro",
+  "description": "Production-Grade Full-Stack Clinical ML & Agentic Decision Support System (ITDO Framework) for early risk detection and clinical care operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
