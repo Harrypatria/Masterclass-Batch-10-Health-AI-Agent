@@ -52,30 +52,6 @@ It demonstrates the full CRISP-DM lifecycle and the practical integration of tra
 
 ---
 
-## Repository Structure
-Masterclass-Batch-10-Health-AI-Agent/
-├── backend/                  # Python ML + Agent layer
-│   ├── train.py              # Model training pipeline
-│   ├── predict_sav.py        # Inference with saved models
-│   ├── agent.py              # Phidata / LLM agent orchestration
-│   ├── data_pipeline.py      # Data loading & preprocessing
-│   ├── preprocessing.py
-│   ├── eval_metrics.py
-│   ├── schemas.py
-│   └── main.py
-├── dataset/                  # Real diabetes (and related) datasets
-├── model/                    # Serialized trained models (.sav / joblib)
-├── reports/                  # Evaluation reports & artifacts
-├── src/                      # React + TypeScript frontend (Vite)
-│   ├── components/
-│   ├── lib/
-│   ├── App.tsx
-│   └── main.tsx
-├── supabase/                 # Optional migrations
-├── requirements.txt
-├── package.json
-└── README.md
-
 ## Tech Stack
 
 **Machine Learning & Agents**
