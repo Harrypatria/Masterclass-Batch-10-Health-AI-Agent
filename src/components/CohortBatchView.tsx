@@ -32,13 +32,19 @@ export const CohortBatchView: React.FC<CohortBatchViewProps> = ({ onSelectPatien
   const [riskFilter, setRiskFilter] = useState<string>('ALL');
 
   useEffect(() => {
-    fetch('/api/dataset/sample')
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.sample_rows) {
-          setDatasetRows(data.sample_rows);
-          // Run batch prediction on dataset sample
-          const processed = data.sample_rows.map((row: any, idx: number) => {
+    let cancelled = false;
+
+    const loadAndPredict = async () => {
+      try {
+        const res = await fetch('/api/dataset/sample');
+        const data = await res.json();
+        if (!data.sample_rows) return;
+
+        setDatasetRows(data.sample_rows);
+
+        // Run batch prediction on dataset sample (Python .sav model per row, in parallel)
+        const processed = await Promise.all(
+          data.sample_rows.map(async (row: any, idx: number) => {
             const features = {
               pregnancies: row.Pregnancies || 0,
               glucose: row.Glucose || 0,
@@ -49,7 +55,7 @@ export const CohortBatchView: React.FC<CohortBatchViewProps> = ({ onSelectPatien
               diabetesPedigree: row.DiabetesPedigreeFunction || 0.4,
               age: row.Age || 30
             };
-            const pred = predictDiabetesProbability(features);
+            const pred = await predictDiabetesProbability(features);
             const flags = flagDiabetesFeatures(features).flags;
 
             return {
@@ -61,12 +67,19 @@ export const CohortBatchView: React.FC<CohortBatchViewProps> = ({ onSelectPatien
               flags_count: flags.length,
               flags
             };
-          });
-          setProcessedBatch(processed);
-        }
-      })
-      .catch((err) => console.error('Failed to load dataset sample:', err))
-      .finally(() => setIsLoading(false));
+          })
+        );
+
+        if (!cancelled) setProcessedBatch(processed);
+      } catch (err) {
+        console.error('Failed to load dataset sample:', err);
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    };
+
+    loadAndPredict();
+    return () => { cancelled = true; };
   }, []);
 
   const filteredRows = processedBatch.filter((row) => {

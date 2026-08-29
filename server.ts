@@ -1,15 +1,33 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import { spawn } from 'child_process';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import OpenAI from 'openai';
 
 const app = express();
 const PORT = 3000;
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+
+// ─── POST /api/auth/login ──────────────────────────────────────────────────
+// Lightweight workshop gate — not a real auth system. Credentials live only
+// on the server so they aren't shipped in the client bundle.
+// ──────────────────────────────────────────────────────────────────────────
+const WORKSHOP_USERNAME = 'masterclass';
+const WORKSHOP_PASSWORD = 'agentic26';
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body || {};
+  if (username === WORKSHOP_USERNAME && password === WORKSHOP_PASSWORD) {
+    return res.json({ ok: true });
+  }
+  return res.status(401).json({ ok: false, error: 'Invalid username or password' });
+});
 
 // In-Memory Database for ITDO Workflow State
 let ALERTS_STORE: any[] = [
@@ -166,6 +184,173 @@ function getGemini(): GoogleGenAI | null {
   return geminiClient;
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+// OpenAI Client — the copilot chat's reasoning + augmentation engine.
+// API key can come from either source, checked in this order:
+//   1. Runtime override — pasted into the in-app Settings panel while the
+//      server is running (POST /api/settings/openai-key). Kept in memory only.
+//   2. .env — OPENAI_API_KEY, loaded once at process start via dotenv/config.
+// A fresh client is constructed per call (cheap) so a runtime key change
+// takes effect on the very next chat message, with no restart needed.
+// ──────────────────────────────────────────────────────────────────────────────
+let runtimeOpenAIKey: string | null = null;
+
+function getOpenAIKey(): { key: string | null; source: 'runtime' | 'env' | null } {
+  if (runtimeOpenAIKey) return { key: runtimeOpenAIKey, source: 'runtime' };
+  if (process.env.OPENAI_API_KEY) return { key: process.env.OPENAI_API_KEY, source: 'env' };
+  return { key: null, source: null };
+}
+
+function getOpenAI(): OpenAI | null {
+  const { key } = getOpenAIKey();
+  return key ? new OpenAI({ apiKey: key }) : null;
+}
+
+function maskKey(key: string): string {
+  if (key.length <= 8) return '••••';
+  return `${key.slice(0, 3)}…${key.slice(-4)}`;
+}
+
+app.get('/api/settings/openai-key', (req, res) => {
+  const { key, source } = getOpenAIKey();
+  res.json({ configured: !!key, source, masked: key ? maskKey(key) : null });
+});
+
+app.post('/api/settings/openai-key', (req, res) => {
+  const { apiKey } = req.body || {};
+  if (typeof apiKey !== 'string' || !apiKey.trim()) {
+    return res.status(400).json({ error: 'apiKey is required' });
+  }
+  runtimeOpenAIKey = apiKey.trim();
+  res.json({ ok: true, masked: maskKey(runtimeOpenAIKey) });
+});
+
+app.delete('/api/settings/openai-key', (req, res) => {
+  runtimeOpenAIKey = null;
+  const { key, source } = getOpenAIKey();
+  res.json({ ok: true, configured: !!key, source });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Python .sav Model Inference Helper
+// Spawns backend/predict_sav.py, sends JSON payload via stdin,
+// parses JSON result from stdout. Falls back to null on error.
+// ──────────────────────────────────────────────────────────────────────────────
+const PYTHON_SCRIPT = path.join(process.cwd(), 'backend', 'predict_sav.py');
+
+function runPythonInference(payload: object): Promise<{
+  probability: number;
+  prediction: number;
+  model_name: string;
+  disease_type: string;
+} | null> {
+  return new Promise((resolve) => {
+    // Skip if script doesn't exist
+    if (!fs.existsSync(PYTHON_SCRIPT)) {
+      console.warn('[ML] predict_sav.py not found at', PYTHON_SCRIPT);
+      resolve(null);
+      return;
+    }
+
+    const py = spawn('python', [PYTHON_SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    let stdout = '';
+    let stderr = '';
+
+    py.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    py.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    py.on('close', (code) => {
+      if (stderr) {
+        // Filter out sklearn InconsistentVersionWarning (non-fatal)
+        const nonFatal = stderr.split('\n').filter(
+          (l) => !l.includes('InconsistentVersionWarning') &&
+                  !l.includes('warnings.warn') &&
+                  !l.includes('https://scikit-learn') &&
+                  l.trim().length > 0
+        );
+        if (nonFatal.length > 0) {
+          console.error('[ML] Python stderr:', nonFatal.join('\n'));
+        }
+      }
+      if (code !== 0 || !stdout.trim()) {
+        console.error('[ML] Python inference failed, code:', code, 'stdout:', stdout);
+        resolve(null);
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim());
+        if (result.error) {
+          console.error('[ML] Python inference error:', result.error);
+          resolve(null);
+        } else {
+          resolve(result);
+        }
+      } catch (e) {
+        console.error('[ML] Failed to parse Python output:', stdout);
+        resolve(null);
+      }
+    });
+
+    py.on('error', (err) => {
+      console.error('[ML] Failed to spawn Python:', err.message);
+      resolve(null);
+    });
+
+    py.stdin.write(JSON.stringify(payload));
+    py.stdin.end();
+  });
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Python .sav Model Evaluation Helper (real holdout metrics)
+// Spawns backend/eval_metrics.py <disease>, which reproduces the exact
+// train/test split used when the .sav model was trained and reports genuine
+// accuracy/AUC/etc. Cached in-memory since it retrains 5 CV folds per call.
+// ──────────────────────────────────────────────────────────────────────────────
+const EVAL_SCRIPT = path.join(process.cwd(), 'backend', 'eval_metrics.py');
+const METRICS_CACHE = new Map<string, { data: any; ts: number }>();
+const METRICS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function runPythonEval(diseaseType: string): Promise<any | null> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(EVAL_SCRIPT)) {
+      resolve(null);
+      return;
+    }
+
+    const py = spawn('python', [EVAL_SCRIPT, diseaseType], { stdio: ['ignore', 'pipe', 'pipe'] });
+
+    let stdout = '';
+    let stderr = '';
+
+    py.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    py.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    py.on('close', (code) => {
+      if (code !== 0 || !stdout.trim()) {
+        console.warn('[Metrics] Python eval failed for', diseaseType, stderr.slice(0, 300));
+        resolve(null);
+        return;
+      }
+      try {
+        const result = JSON.parse(stdout.trim());
+        if (result.error) {
+          console.warn('[Metrics] Python eval error for', diseaseType, ':', result.error);
+          resolve(null);
+        } else {
+          resolve(result);
+        }
+      } catch (e) {
+        resolve(null);
+      }
+    });
+
+    py.on('error', () => resolve(null));
+  });
+}
+
+
 // ----------------------------------------------------
 // API ROUTES
 // ----------------------------------------------------
@@ -173,9 +358,11 @@ function getGemini(): GoogleGenAI | null {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'healthy',
-    version: '3.1.0',
-    framework: 'ITDO + CRISP-DM',
-    gemini_configured: !!process.env.GEMINI_API_KEY,
+    version: '3.2.0',
+    framework: 'ITDO + CRISP-DM + Trained .sav ML Models',
+    openai_configured: !!getOpenAIKey().key,
+    python_model: fs.existsSync(PYTHON_SCRIPT),
+    model_path: PYTHON_SCRIPT,
     timestamp: new Date().toISOString()
   });
 });
@@ -337,30 +524,143 @@ Return ONLY a valid JSON object matching:
   });
 });
 
+// ─── POST /api/chat ────────────────────────────────────────────────────────
+// Copilot chat: reasons over predictions and answers free-form questions,
+// powered by OpenAI (key from Settings-panel override, else .env). Grounded
+// in the current on-screen prediction context (if any) and an optional
+// uploaded attachment (image or text). Falls back to a short deterministic
+// answer only when no OpenAI key is configured at all.
+// ──────────────────────────────────────────────────────────────────────────
+const OPENAI_CHAT_MODEL = process.env.OPENAI_CHAT_MODEL || 'gpt-4o-mini';
+
+app.post('/api/chat', async (req, res) => {
+  const { message = '', history = [], context, attachment } = req.body;
+
+  // ── Augmentation layer: ground the assistant in the exact model, the raw
+  // input data that was submitted, and the resulting prediction — rather
+  // than letting it reason from the bare probability alone. ─────────────────
+  const contextBlock = context
+    ? [
+        `MODEL CARD`,
+        `- Model: ${context.model_name}`,
+        `- Disease screened: ${context.disease_type}`,
+        ``,
+        `INPUT DATA (as submitted by the user)`,
+        context.raw_features && Object.keys(context.raw_features).length
+          ? Object.entries(context.raw_features).map(([k, v]) => `- ${k}: ${v}`).join('\n')
+          : '(not provided)',
+        ``,
+        `PREDICTION RESULT`,
+        `- Probability: ${(context.probability * 100).toFixed(1)}%`,
+        `- Risk level: ${context.risk_level}`,
+        `- Deterministic abnormal flags: ${Array.isArray(context.flags) && context.flags.length ? context.flags.join('; ') : 'none'}`
+      ].join('\n')
+    : 'No prediction is currently on screen — the user has not run the model yet.';
+
+  const openai = getOpenAI();
+
+  if (openai) {
+    try {
+      const systemPrompt = `You are the AI Health Copilot chat assistant. Your job is to REASON over the grounding data provided in each turn (a model card, the exact input values, and the prediction result) and explain WHY the model produced its result, or answer the user's question using only that data — never invent clinical facts that aren't in it. Be short, plain, and direct (2-5 sentences, no headers, no markdown tables). Always defer to a licensed clinician for actual diagnosis.`;
+
+      const historyMessages = Array.isArray(history)
+        ? history.slice(-8).map((h: any) => ({
+            role: h.role === 'user' ? 'user' : 'assistant',
+            content: h.text
+          }))
+        : [];
+
+      const userTextParts = [`GROUNDING DATA:\n${contextBlock}`, `\nUser: ${message || '(see attachment)'}`];
+      if (attachment?.text) {
+        userTextParts.push(`\nAttached file "${attachment.name}":\n${attachment.text}`);
+      }
+
+      const userContent: any[] = [{ type: 'text', text: userTextParts.join('\n') }];
+      if (attachment?.dataBase64 && attachment?.mimeType) {
+        userContent.push({
+          type: 'image_url',
+          image_url: { url: `data:${attachment.mimeType};base64,${attachment.dataBase64}` }
+        });
+      }
+
+      const completion = await openai.chat.completions.create({
+        model: OPENAI_CHAT_MODEL,
+        temperature: 0.3,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...historyMessages,
+          { role: 'user', content: userContent }
+        ] as any
+      });
+
+      const reply = completion.choices[0]?.message?.content?.trim() || "I couldn't generate a response.";
+      return res.json({ reply, source: 'openai-agent', model: OPENAI_CHAT_MODEL });
+    } catch (err: any) {
+      console.warn('Chat: OpenAI error, falling back:', err.message);
+    }
+  }
+
+  // ── Deterministic fallback (no OpenAI key configured) ──────────────────────
+  let reply: string;
+  if (!context) {
+    reply = 'Add your OpenAI API key in Settings, then run a prediction so I have something to reason over.';
+  } else {
+    const pct = (context.probability * 100).toFixed(1);
+    const flagsText = Array.isArray(context.flags) && context.flags.length
+      ? context.flags.slice(0, 3).join('; ')
+      : 'no abnormal flags';
+    const inputSummary = context.raw_features && Object.keys(context.raw_features).length
+      ? ' Submitted values — ' + Object.entries(context.raw_features).slice(0, 5).map(([k, v]) => `${k}: ${v}`).join(', ') + '.'
+      : '';
+    reply = `This ${context.disease_type} prediction is ${pct}% (${context.risk_level} risk), from ${context.model_name}. Main drivers: ${flagsText}.${inputSummary} Add an OpenAI API key in Settings for full reasoning and file-reading. This is screening support only — confirm with a clinician before acting on it.`;
+  }
+  return res.json({ reply, source: 'deterministic-fallback' });
+});
+
 // Predictions History & Creation
 app.get('/api/predictions', (req, res) => {
   res.json(PREDICTIONS_STORE);
 });
 
-app.post('/api/predict', (req, res) => {
+// ─── POST /api/predict ─────────────────────────────────────────────────────
+// Primary prediction endpoint. Calls the trained .sav model via Python.
+// Falls back to the logistic heuristic if Python is unavailable.
+// ──────────────────────────────────────────────────────────────────────────
+app.post('/api/predict', async (req, res) => {
   const { patient_ref = 'PT-DEMO', disease_type = 'diabetes', features } = req.body;
-  const flags = getAbnormalFlags(features || {});
-  
-  // Calculate probability
-  const glucose = features.glucose || 100;
-  const bmi = features.bmi || 25;
-  const age = features.age || 30;
-  const pedigree = features.diabetesPedigree || 0.4;
-  const pregnancies = features.pregnancies || 0;
+  const f = features || {};
 
-  const z =
-    (glucose - 100) * 0.035 +
-    (bmi - 25) * 0.09 +
-    (age - 30) * 0.03 +
-    (pedigree - 0.4) * 0.8 +
-    (pregnancies - 2) * 0.08;
+  // Deterministic clinical flags (works for all disease types)
+  const flags = getAbnormalFlags(f);
 
-  const proba = Math.max(0.02, Math.min(0.98, 1 / (1 + Math.exp(-z))));
+  let proba: number;
+  let model_name: string;
+
+  // ── Try Python .sav model first ──────────────────────────────────────────
+  const pyResult = await runPythonInference({ disease_type, features: f });
+
+  if (pyResult && typeof pyResult.probability === 'number') {
+    proba = pyResult.probability;
+    model_name = pyResult.model_name;
+    console.log(`[ML] ${disease_type} → ${model_name}: probability=${proba}`);
+  } else {
+    // ── Fallback: calibrated logistic heuristic (diabetes only) ─────────
+    console.warn('[ML] Falling back to heuristic (Python model unavailable)');
+    const glucose = f.glucose || 100;
+    const bmi = f.bmi || 25;
+    const age = f.age || 30;
+    const pedigree = f.diabetesPedigree || 0.4;
+    const pregnancies = f.pregnancies || 0;
+    const z =
+      (glucose - 100) * 0.035 +
+      (bmi - 25) * 0.09 +
+      (age - 30) * 0.03 +
+      (pedigree - 0.4) * 0.8 +
+      (pregnancies - 2) * 0.08;
+    proba = Math.max(0.02, Math.min(0.98, 1 / (1 + Math.exp(-z))));
+    model_name = 'logistic_heuristic_fallback';
+  }
+
   const risk_level = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
 
   const predRecord = {
@@ -370,11 +670,39 @@ app.post('/api/predict', (req, res) => {
     probability: Number(proba.toFixed(4)),
     risk_level,
     flags,
+    model_name,
+    model_source: pyResult ? 'trained_sav_model' : 'heuristic_fallback',
     created_at: new Date().toISOString()
   };
 
   PREDICTIONS_STORE.unshift(predRecord);
   res.json(predRecord);
+});
+
+// ─── GET /api/model-metrics/:disease ──────────────────────────────────────
+// Real holdout evaluation metrics (accuracy/AUC/ROC/PR/feature importances)
+// computed live from the trained .sav model against its original test split.
+// Returns 404 when the model/dataset can't be evaluated (e.g. incomplete
+// dataset) so the client falls back to precomputed static metrics.
+// ──────────────────────────────────────────────────────────────────────────
+app.get('/api/model-metrics/:disease', async (req, res) => {
+  const disease = req.params.disease;
+  if (!['diabetes', 'heart', 'parkinsons'].includes(disease)) {
+    return res.status(400).json({ error: 'Unknown disease_type' });
+  }
+
+  const cached = METRICS_CACHE.get(disease);
+  if (cached && Date.now() - cached.ts < METRICS_CACHE_TTL_MS) {
+    return res.json(cached.data);
+  }
+
+  const result = await runPythonEval(disease);
+  if (!result) {
+    return res.status(404).json({ error: 'Live model evaluation unavailable for this disease' });
+  }
+
+  METRICS_CACHE.set(disease, { data: result, ts: Date.now() });
+  res.json(result);
 });
 
 // Alerts CRUD
@@ -465,7 +793,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AI Health Copilot Pro server listening on http://0.0.0.0:${PORT}`);
+    console.log(`AI Health Copilot Pro server listening on http://127.0.0.1:${PORT}`);
   });
 }
 

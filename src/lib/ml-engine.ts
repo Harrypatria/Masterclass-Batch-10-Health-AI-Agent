@@ -15,7 +15,9 @@ import {
 } from '../types';
 import { flagDiabetesFeatures, flagHeartFeatures, flagParkinsonsFeatures } from './deterministic-flags';
 
-// Pima Diabetes Dataset Imputation Medians (calculated after replacing biological zeros with NaN)
+// ──────────────────────────────────────────────────────────────────────────────
+// Pima Diabetes Dataset parameters kept for fallback only
+// ──────────────────────────────────────────────────────────────────────────────
 export const DIABETES_IMPUTATION_MEDIANS = {
   pregnancies: 3.0,
   glucose: 117.0,
@@ -27,122 +29,101 @@ export const DIABETES_IMPUTATION_MEDIANS = {
   age: 29.0
 };
 
-// Pima Diabetes StandardScaler Mean & Std
 export const DIABETES_SCALER = {
   mean: [3.845, 121.687, 72.405, 29.153, 140.672, 32.457, 0.472, 33.241],
   std: [3.370, 30.436, 12.096, 8.791, 86.383, 6.875, 0.331, 11.760]
 };
 
-// Trained Logistic Regression Weights for Diabetes
 export const DIABETES_LR_WEIGHTS = {
   intercept: -0.842,
-  weights: [
-    0.345,  // Pregnancies
-    1.124,  // Glucose (high importance)
-    -0.125, // BloodPressure
-    0.042,  // SkinThickness
-    -0.082, // Insulin
-    0.684,  // BMI (high importance)
-    0.392,  // DiabetesPedigree
-    0.388   // Age (high importance)
-  ]
+  weights: [0.345, 1.124, -0.125, 0.042, -0.082, 0.684, 0.392, 0.388]
 };
 
 /**
- * Predict Diabetes Risk Probability using Calibrated Ensemble ML Pipeline
+ * Predict Diabetes Risk Probability
+ * Primary: POST /api/predict → Python SVC model (diabetes_model.sav)
+ * Fallback: client-side logistic regression approximation
  */
-export function predictDiabetesProbability(features: PatientDiabetesFeatures): {
+export async function predictDiabetesProbability(features: PatientDiabetesFeatures): Promise<{
   probability: number;
   risk_level: RiskLevel;
   model_name: string;
-} {
-  // 1. Audit & Impute Biological Zeros
+  latency_ms: number;
+}> {
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disease_type: 'diabetes', features })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const proba = Number(data.probability);
+      const risk_level: RiskLevel = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
+      return {
+        probability: proba,
+        risk_level,
+        model_name: data.model_name || 'SVC_Diabetes_v1.0',
+        latency_ms: Math.round(performance.now() - t0)
+      };
+    }
+  } catch (_) {
+    // fall through to client-side fallback
+  }
+
+  // ── Client-side fallback (logistic regression approximation) ──────────────
   const glucose = features.glucose <= 0 ? DIABETES_IMPUTATION_MEDIANS.glucose : features.glucose;
   const bp = features.bloodPressure <= 0 ? DIABETES_IMPUTATION_MEDIANS.bloodPressure : features.bloodPressure;
   const skin = features.skinThickness <= 0 ? DIABETES_IMPUTATION_MEDIANS.skinThickness : features.skinThickness;
   const insulin = features.insulin <= 0 ? DIABETES_IMPUTATION_MEDIANS.insulin : features.insulin;
   const bmi = features.bmi <= 0 ? DIABETES_IMPUTATION_MEDIANS.bmi : features.bmi;
-  const pregnancies = features.pregnancies;
-  const pedigree = features.diabetesPedigree;
-  const age = features.age;
-
-  // 2. Standardize Features
-  const raw = [pregnancies, glucose, bp, skin, insulin, bmi, pedigree, age];
+  const raw = [features.pregnancies, glucose, bp, skin, insulin, bmi, features.diabetesPedigree, features.age];
   const scaled = raw.map((val, idx) => (val - DIABETES_SCALER.mean[idx]) / DIABETES_SCALER.std[idx]);
-
-  // 3. Logistic Regression Component
   let logit = DIABETES_LR_WEIGHTS.intercept;
-  for (let i = 0; i < scaled.length; i++) {
-    logit += DIABETES_LR_WEIGHTS.weights[i] * scaled[i];
-  }
-  const proba_lr = 1 / (1 + Math.exp(-logit));
-
-  // 4. Random Forest Non-Linear Decision Stumps Ensemble (Trees simulation based on max_depth=5 trained ensemble)
-  let treeSum = 0;
-  // Tree 1: Glucose + BMI Primary Split
-  if (glucose > 127) {
-    if (bmi > 29.9) treeSum += (age > 28 ? 0.88 : 0.72);
-    else treeSum += 0.54;
-  } else {
-    if (bmi > 34.0) treeSum += (pedigree > 0.5 ? 0.48 : 0.32);
-    else treeSum += (age > 45 ? 0.28 : 0.09);
-  }
-
-  // Tree 2: Glucose + Age + Pedigree
-  if (glucose > 145) {
-    treeSum += 0.85;
-  } else if (glucose > 105) {
-    if (age > 35) treeSum += (bmi > 30 ? 0.65 : 0.45);
-    else treeSum += (pedigree > 0.6 ? 0.42 : 0.24);
-  } else {
-    treeSum += (pedigree > 0.8 ? 0.22 : 0.06);
-  }
-
-  // Tree 3: BMI + Insulin resistance + Pregnancies
-  if (bmi > 35) {
-    treeSum += (glucose > 115 ? 0.82 : 0.52);
-  } else if (bmi > 25) {
-    treeSum += (pregnancies > 4 ? 0.46 : 0.26);
-  } else {
-    treeSum += 0.08;
-  }
-
-  // Tree 4: Age + Pedigree + Glucose
-  if (age > 45) {
-    treeSum += (glucose > 120 ? 0.79 : 0.39);
-  } else {
-    treeSum += (glucose > 135 ? 0.74 : 0.16);
-  }
-
-  const proba_rf = treeSum / 4.0;
-
-  // Calibrated Ensemble Output (0.65 RF + 0.35 LR for optimal AUC)
-  let final_proba = 0.65 * proba_rf + 0.35 * proba_lr;
-  
-  // Boundary safeguards
-  final_proba = Math.max(0.01, Math.min(0.99, final_proba));
-
-  const risk_level: RiskLevel =
-    final_proba >= 0.70 ? 'high' : final_proba >= 0.40 ? 'moderate' : 'low';
-
-  return {
-    probability: Number(final_proba.toFixed(4)),
-    risk_level,
-    model_name: 'RandomForestClassifier_Pipeline_v3.1'
-  };
+  for (let i = 0; i < scaled.length; i++) logit += DIABETES_LR_WEIGHTS.weights[i] * scaled[i];
+  const final_proba = Math.max(0.01, Math.min(0.99, 1 / (1 + Math.exp(-logit))));
+  const risk_level: RiskLevel = final_proba >= 0.70 ? 'high' : final_proba >= 0.40 ? 'moderate' : 'low';
+  return { probability: Number(final_proba.toFixed(4)), risk_level, model_name: 'LR_Fallback_Client', latency_ms: Math.round(performance.now() - t0) };
 }
 
 /**
  * Predict Heart Disease Risk Probability
+ * Primary: POST /api/predict → Python LogisticRegression model (heart_disease_model.sav)
+ * Fallback: client-side logistic approximation
  */
-export function predictHeartProbability(features: PatientHeartFeatures): {
+export async function predictHeartProbability(features: PatientHeartFeatures): Promise<{
   probability: number;
   risk_level: RiskLevel;
   model_name: string;
-} {
+  latency_ms: number;
+}> {
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disease_type: 'heart', features })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const proba = Number(data.probability);
+      const risk_level: RiskLevel = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
+      return {
+        probability: proba,
+        risk_level,
+        model_name: data.model_name || 'LogisticRegression_Heart_v1.0',
+        latency_ms: Math.round(performance.now() - t0)
+      };
+    }
+  } catch (_) {
+    // fall through to fallback
+  }
+
+  // ── Client-side fallback ──────────────────────────────────────────────────
   let score = -1.2;
   score += features.sex === 1 ? 0.45 : -0.2;
-  score += (features.cp || 0) * 0.55; // Chest pain types
+  score += (features.cp || 0) * 0.55;
   score += ((features.trestbps - 120) / 20) * 0.28;
   score += ((features.chol - 200) / 40) * 0.22;
   score += features.fbs === 1 ? 0.35 : 0;
@@ -150,40 +131,80 @@ export function predictHeartProbability(features: PatientHeartFeatures): {
   score += features.exang === 1 ? 0.75 : -0.3;
   score += (features.oldpeak || 0) * 0.65;
   score += ((features.age - 50) / 10) * 0.32;
-
   const proba = Math.max(0.02, Math.min(0.98, 1 / (1 + Math.exp(-score))));
   const risk_level: RiskLevel = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
-
-  return {
-    probability: Number(proba.toFixed(4)),
-    risk_level,
-    model_name: 'HeartDisease_LogisticRegression_v3.1'
-  };
+  return { probability: Number(proba.toFixed(4)), risk_level, model_name: 'HeartDisease_LR_Fallback_Client', latency_ms: Math.round(performance.now() - t0) };
 }
 
 /**
  * Predict Parkinson's Disease Risk Probability
+ * Primary: POST /api/predict → Python SVC model (parkinsons_model.sav)
+ * Fallback: client-side acoustic feature scoring
  */
-export function predictParkinsonsProbability(features: PatientParkinsonsFeatures): {
+export async function predictParkinsonsProbability(features: PatientParkinsonsFeatures): Promise<{
   probability: number;
   risk_level: RiskLevel;
   model_name: string;
-} {
+  latency_ms: number;
+}> {
+  const t0 = performance.now();
+  try {
+    const resp = await fetch('/api/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ disease_type: 'parkinsons', features })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const proba = Number(data.probability);
+      const risk_level: RiskLevel = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
+      return {
+        probability: proba,
+        risk_level,
+        model_name: data.model_name || 'SVC_Parkinsons_v1.0',
+        latency_ms: Math.round(performance.now() - t0)
+      };
+    }
+  } catch (_) {
+    // fall through to fallback
+  }
+
+  // ── Client-side fallback ──────────────────────────────────────────────────
   let score = -0.5;
   score += (features.jitterPct / 0.005) * 0.65;
   score += (features.shimmer / 0.03) * 0.75;
   score += ((22 - features.hnr) / 4) * 0.55;
   score += (features.ppe / 0.2) * 0.85;
   score += (features.rpde - 0.5) * 1.2;
-
   const proba = Math.max(0.02, Math.min(0.98, 1 / (1 + Math.exp(-score))));
   const risk_level: RiskLevel = proba >= 0.70 ? 'high' : proba >= 0.40 ? 'moderate' : 'low';
+  return { probability: Number(proba.toFixed(4)), risk_level, model_name: 'Parkinsons_SVM_Fallback_Client', latency_ms: Math.round(performance.now() - t0) };
+}
 
-  return {
-    probability: Number(proba.toFixed(4)),
-    risk_level,
-    model_name: 'Parkinsons_SVM_v3.1'
-  };
+
+
+/**
+ * Fetch Real Holdout Model Metrics from the Trained .sav Model
+ * Primary: GET /api/model-metrics/:disease → live evaluation against the
+ * model's original train/test split (backend/eval_metrics.py).
+ * Fallback: precomputed static benchmark metrics (getModelMetrics below),
+ * used when Python evaluation is unavailable or the dataset can't support
+ * a live holdout split (e.g. a single-class dataset).
+ */
+export async function fetchModelMetrics(diseaseType: DiseaseType = 'diabetes'): Promise<{
+  metrics: ModelMetrics;
+  source: 'trained_sav_model_holdout_eval' | 'static_fallback';
+}> {
+  try {
+    const resp = await fetch(`/api/model-metrics/${diseaseType}`);
+    if (resp.ok) {
+      const data = await resp.json();
+      return { metrics: data as ModelMetrics, source: 'trained_sav_model_holdout_eval' };
+    }
+  } catch (_) {
+    // fall through to static fallback
+  }
+  return { metrics: getModelMetrics(diseaseType), source: 'static_fallback' };
 }
 
 /**
